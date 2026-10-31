@@ -1,0 +1,271 @@
+#pragma once
+#include <functional>
+#include <string>
+#include <vector>
+#include "rmtc/config.h"
+#include "rmtc/json.h"
+#include "rmtc/world.h"
+#include "rmtc/radar.h"
+#include "rmtc/combat.h"
+#include "rmtc/planner.h"
+#include "rmtc/event.h"
+#include "rmtc/event_prompt.h"
+#include "rmtc/llm.h"
+
+// Agent：感知 → 世界/敌情 → 决策 → 动作编码 的门面。
+// 与 ROS 无关，便于离线测试与仿真（match4 / stage2_probe）。
+//
+// 第二阶段初稿在基线之上加了三组东西：
+//   1) retired0_/retired1_：识别"迟到的上一场感知"，避免把状态倒回旧场；
+//   2) nav_dist_/nav_parent_ + tryReach：reach 任务的截止倒推导航；
+//   3) last_cmd_dir_/illusion_until_：用回执的 effective_direction 识别幻术并反向补偿。
+namespace rmtc {
+
+// 本车坐标是否落在地图内（World::idx 不做边界检查，调用方必须先验）。
+bool insideMap(const Perception& p);
+
+class Agent {
+public:
+    typedef std::function<void(int level, const std::string& msg)> Logger;
+
+    explicit Agent(const Config& cfg);
+
+    void setLogger(Logger l) { log_ = l; }
+
+    // 挂载异步 LLM 客户端（不接管所有权；不挂载 = 纯本地策略，模拟器默认）。
+    // 挂载后：event_text 变化自动提交、每 Tick poll 结果、事件池驱动避险与目标。
+    void attachLlm(LlmClient* c) { llm_ = c; }
+
+    // 输入一帧感知 JSON，返回动作 JSON（可能为空串 = 本轮不提交）。
+    std::string onPerception(const std::string& data);
+
+    // 公开话题 /referee/event_text、/referee/mission 的文本注入（main.cpp 调用）。
+    // 协议 §3 规定公告话题逐条发送，感知里的 event_text 只是“近期公告”缓存
+    // （容量有限、不保证包含整场历史）。只依赖感知缓存时，公告一旦被挤出缓存，
+    // 事件就永远不会进入 LLM；这两个入口把公告独立于感知缓存接进来。
+    void onRefereeEventText(const std::string& text);
+    void onRefereeMissionText(const std::string& text);
+
+    // ---- 内部件访问器（测试/上层策略用）----
+    World& world() { return world_; }
+    Radar& radar() { return radar_; }
+    Combat& combat() { return combat_; }
+    Planner& planner() { return planner_; }
+    const Config& config() const { return cfg_; }
+    const std::string& sessionId() const { return session_id_; }
+    int lastTick() const { return last_tick_; }
+    const Perception& lastPerception() const { return last_p_; }
+    const Decision& lastDecision() const { return last_d_; }
+    double plannerRate() const { return planner_rate_; }
+    bool economyGateActive() const { return last_economy_gate_; }
+    // 事件池状态（测试/诊断）
+    int activeEventCount() const { return static_cast<int>(active_events_.size()); }
+    // /referee/event_text 待提交队列长度（测试/诊断：重放去重应保持 0/不增长）。
+    int refereeEventCount() const { return static_cast<int>(referee_events_.size()); }
+    // 测试专用：直接注入结构化事件，绕过 LLM/event_text。生产禁止调用。
+    void injectTestEvent(const EventReport& r);
+    int eventVetoTicks() const { return event_veto_ticks_; }
+    int eventTargetTicks() const { return event_target_ticks_; }
+    int testEventsInjected() const { return test_events_injected_; }
+    bool quotaSecured() const { return ai_quota_secured_; }
+    bool llmDisabled() const { return llm_disabled_; }
+    int handshakeAttempts() const { return handshake_attempts_; }
+    int lastLlmStatus() const { return last_llm_status_; }
+    const std::string& lastLlmError() const { return last_llm_error_; }
+    int threatLevel() const { return static_cast<int>(threat_level_); }
+    // 评测机制计数：只在换场时清零，用来证明开关真的进了决策路径。
+    int contestHits() const { return contest_hits_; }
+    int gateEngagedTicks() const { return gate_engaged_ticks_; }
+    int economyHoldTicks() const { return economy_hold_ticks_; }
+    // 经济门在"最近掉过血/被同轴敌车开火"时仍然压住攻击的 Tick 数（诊断"影子蹭血"）。
+    int economyHoldDamagedTicks() const { return economy_hold_damaged_ticks_; }
+    int defensiveTicks() const { return defensive_ticks_; }
+    // v1.2 事件利用计数（证明开关进入决策路径，不是死代码）。
+    int pepperTrapCount() const { return pepper_traps_; }
+    int unrivaledGrants() const { return unrivaled_grants_; }
+    int unrivaledAttackCount() const { return unrivaled_attacks_; }
+    int splitEscapeCount() const { return split_escapes_; }
+    int panHoldCount() const { return pan_holds_; }
+    // v1.2 伤害任务未完成 → 本 Tick 关闭 D 止盈/提高接战意愿（诊断用）。
+    bool damageMissionActive() const { return damage_mission_active_; }
+    int damageMissionTicks() const { return damage_mission_ticks_; }
+
+private:
+    enum ThreatLevel {
+        THREAT_SAFE = 0,
+        THREAT_ALERT = 1,
+        THREAT_ENGAGED = 2
+    };
+    void updateThreatLevel(const Perception& p);
+    bool damageMissionPending(const Perception& p) const;
+    bool reachDeadlineUrgent(const Perception& p) const;
+    bool hasEasyKill(const Perception& p) const;
+    void applyAlertSoftCost(const Perception& p);
+    void applyThreatSoftCost(const Perception& p);
+    bool updateDefensiveMode(const Perception& p);
+    void applyDefensiveSoftBlocks(const Perception& p);
+
+    struct Attempt {
+        bool valid = false;
+        int tick = -1;
+        int x = -1, y = -1;
+    };
+
+    enum ReceiptKind {
+        RECEIPT_NONE,
+        RECEIPT_TERRAIN,
+        RECEIPT_OCCUPANCY
+    };
+
+    struct AvoidCell {
+        int idx = -1;
+        int until = -1;
+    };
+
+    bool parsePerception(const std::string& data, Perception& p);
+    // 结构化 missions 里缺少带坐标的 reach 时，用任务公告原文兜底补一条。
+    // 规则 §8.1 只要求“随机事件”必须由 LLM 理解；任务公告是另一类信息，
+    // 这里只做坐标抽取（不替代任何事件判断），保证 reach 不因 LLM 失败而消失。
+    void ensureReachMission(Perception& p);
+    ReceiptKind classifyReceipt(const Perception& p) const;
+    void rememberAvoid(int idx, int until);
+    void applySoftBlocks(const Perception& p);
+    // LLM/事件（网关清单 §2/§3/§4；不挂载 LLM 时全部为空操作）
+    void pumpLlm(const Perception& p);          // poll 结果 → 事件池 + 资格/降级标志
+    void submitEvents(const Perception& p);     // 新公告 → 请求体提交（含盲发保底）
+    void advanceEventPrefix();                  // 在途公告行处理完：推进/出队
+    void refreshEvents(const Perception& p);    // 每 Tick 重打分 + 过期清理
+    Decision decide(const Perception& p);
+    // 未完成且带坐标的 reach 任务（没有返回 NULL）。
+    const Mission* reachMission(const Perception& p) const;
+    // reach 点到本车的真实最短路步数（不可达返回 -1）；冲刺窗口用。
+    int reachPathSteps(const Perception& p);
+    bool tryReach(const Perception& p, Decision& d);
+    // 死线保底：忽略软阻挡（仍尊重墙/边界）朝任务点走一步，只在最后几 Tick 用。
+    bool tryReachDirect(const Perception& p, Decision& d);
+    bool tryNoTargetFallback(const Perception& p, Decision& d);
+    bool tryPostResourceHunt(const Perception& p, Decision& d);
+    bool tryReachContest(const Perception& p, Decision& d);
+    // v1.2 事件利用：辣椒踩点 / 无双 5×5 攻击。
+    bool tryPepperTrap(const Perception& p, Decision& d);
+    bool trySplitEscape(const Perception& p, Decision& d);
+    bool panMovementWindow(const Perception& p) const;
+    void updateUnrivaledState(const Perception& p);
+    void updateEffectState(const Perception& p);
+    bool tryUnrivaledAttack(const Perception& p, Decision& d);
+    std::string encodeAction(const Perception& p, const Decision& d) const;
+
+    void logf(int level, const std::string& msg) {
+        if (log_) log_(level, msg);
+    }
+
+    Config cfg_;
+    World world_;
+    Radar radar_;
+    Combat combat_;
+    Planner planner_;
+
+    Logger log_;
+    std::string session_id_;
+    bool has_session_ = false;
+    int last_tick_;
+    Decision last_d_;
+    std::string cached_action_;
+    Attempt attempted_;
+    std::vector<AvoidCell> avoid_;
+    Perception last_p_;
+    double planner_rate_ = 0.0;  // 采集计划边际率（planValue/planCost，资源价值/Tick），
+                                 // 战斗层的机会成本来源；资源价值单位，Combat 侧 ×0.25 折成分
+    int planner_rate_tick_ = -1; // 上次刷新 planner_rate_ 的 Tick；防止战斗连续接管时用陈旧值
+    int econ_target_ = -1;       // P1：上次经济门采信的资源目标
+    int econ_target_dist_ = 999; // P1：到该目标的曼哈顿距离
+    int econ_stall_ticks_ = 0;   // P1：连续未接近目标的 Tick 数
+    bool last_economy_gate_ = false;  // 本 Tick 经济门是否生效（诊断）
+    int no_target_streak_ = 0;   // P4：连续 no_target 的 Tick 数
+    int no_target_patrol_idx_ = 0;  // P4：无目标巡逻的 waypoint 轮换
+
+    // ---- 接战门（Agent 层状态机；换场必须复位）----
+    ThreatLevel threat_level_ = THREAT_SAFE;
+    int combat_lock_until_ = -1;  // ENGAGED 防抖锁
+    int last_damage_tick_ = -9999;  // 最近一次掉血（3 Tick 退出条件 + 威胁分级）
+    int combat_base_depth_ = -1;    // match4 可能覆盖 depth；首次决策时冻结“满深搜”深度
+    int gate_engaged_ticks_ = 0;    // ENGAGED 状态的 Tick 数（机制触发计数）
+    int economy_hold_ticks_ = 0;    // 经济门压住可选攻击的 Tick 数
+    int economy_hold_damaged_ticks_ = 0;  // 其中"最近 3 Tick 掉过血"仍被压住的 Tick 数
+    int defensive_ticks_ = 0;       // 防御性苟活状态 Tick 数
+    bool defensive_mode_ = false;   // 本 Tick 是否处于防御性苟活
+    int contest_hits_ = 0;          // 四阶争夺真正接管动作的次数
+
+    // ---- AI 网关与事件池（网关清单 §2/§3/§4；不挂载 LLM 时全部空转）----
+    struct ActiveEvent {
+        EventReport report;
+        EventAdvice advice;  // 每 Tick 重算（距离/HP 在变）
+    };
+    LlmClient* llm_ = NULL;          // 不接管所有权；NULL = 纯本地
+    EventScorer scorer_;
+    std::vector<ActiveEvent> active_events_;
+    std::string last_event_text_;    // 已成功提交的公告前缀（不是整段快照）
+    // /referee/event_text 逐条收到的公告（去重后待提交）。与感知 event_text
+    // 分开排队：感知缓存被裁掉/换场重放时，这里的公告仍然能送进 LLM。
+    std::vector<std::string> referee_events_;
+    // 本场已入队/已提交的公告行（trim 后的原文）。协议 §3：公告话题逐条发送、
+    // 感知 event_text 会重复包含近期公告、TRANSIENT_LOCAL 还会重放；重复收到
+    // 不代表事件重复触发。这里跨“感知缓存 + 公开话题 + 重放”做本场永久去重。
+    std::vector<std::string> seen_event_lines_;
+    std::string referee_mission_text_;  // /referee/mission 最近一条任务公告原文
+    // reach 坐标兜底缓存：任务公告只在某一帧出现时，后续帧仍能继续导航。
+    bool reach_hint_valid_ = false;
+    int reach_hint_x_ = -1, reach_hint_y_ = -1;
+    int event_retry_delay_ = 5;      // 429/超时的指数退避起点
+    int event_invalid_streak_ = 0;   // 连续“200 但模型输出不合法”的次数
+    std::string event_pending_prefix_;  // 当前在途公告行提交成功后的前缀
+    long event_pending_seq_ = -1;       // 在途公告行的 LlmClient seq
+    int event_pending_tick_ = -1;       // 在途公告提交的 Tick（防丢结果卡死）
+    bool event_pending_is_ref_ = false; // 在途行来自 referee_events_（不是感知前缀）
+    int event_line_attempts_ = 0;       // 当前公告行“2xx 但内容不合法”的重试次数
+    // v1.2 §8.9：自己易伤的绝对到期 Tick；§8.8：洁身自好本 Tick 是否生效。
+    int self_vulnerable_until_ = -1;
+    bool thorns_active_ = false;
+    // §8.3：激活 Tick 在幻术矩形内时，即使本 Tick 没移动也要保持 50 Tick。
+    int illusion_from_event_until_ = -1;
+    int event_veto_ticks_ = 0;       // 事件 Veto 实际接管动作的 Tick 数（诊断）
+    int event_target_ticks_ = 0;     // 事件目标抢占实际接管动作的 Tick 数（诊断）
+    int test_events_injected_ = 0;   // 测试注入的结构化事件数（生产恒 0）
+    bool ai_quota_secured_ = false;  // 本场已拿到成功调用记录（任务 15 分的保险）
+    bool llm_disabled_ = false;      // 额度耗尽（quota_exceeded）→ 本场不再提交
+    int last_handshake_tick_ = -1;   // 上次盲发 Tick（按 session 内相对时间重试）
+    int session_start_tick_ = -1;    // 本场第一个感知的 tick（握手窗口相对它计算）
+    int handshake_attempts_ = 0;     // 本场已提交的握手次数（诊断/上限）
+    int last_llm_status_ = 0;        // 最近一次 LLM 结果 HTTP 状态（0=传输失败）
+    int last_ai_warn_tick_ = -1;     // 上次“资格未落袋”ERROR 的 tick
+    std::string last_llm_error_;     // 最近一次失败原因（诊断）
+    int event_retry_after_tick_ = -1;  // 事件可重试失败后的退避截止 Tick
+
+    // ---- v1.2 事件利用状态 ----
+    int pepper_traps_ = 0;       // 实际踩辣椒点次数
+    int unrivaled_stay_ = 0;     // 连续驻留堡垒 Tick（离开/死亡清零）
+    int unrivaled_until_ = -1;   // 推断的无双增益到期 Tick
+    int unrivaled_grants_ = 0;   // 推断获得增益次数
+    int unrivaled_attacks_ = 0;  // 用 5×5 攻击接管动作次数
+    bool damage_mission_active_ = false;  // 本 Tick 是否处于伤害任务强化模式
+    int damage_mission_ticks_ = 0;        // 本场累计强化 Tick（诊断/压测）
+    int split_escapes_ = 0;               // 分裂线提前逃离次数
+    int pan_holds_ = 0;                   // 潘潘窗口内把探索移动改成防御的次数
+
+    // ---- 初稿新增的三组状态 ----
+    std::vector<float> nav_dist_;   // tryReach 的最短路步数（复用缓冲）
+    std::vector<int> nav_parent_;   // tryReach 的前驱
+    int last_reach_steps_ = -1;     // 上次算出的 reach 最短路步数（冲刺窗口用）
+    // 任务点被占的四阶争夺状态（只服务唯一的 reach 任务）
+    struct ContestedState {
+        int wait_ticks = 0;      // 连续争夺 Tick
+        int abandon_until = -1;  // 低血止损到该 Tick
+    };
+    ContestedState reach_contest_;
+    std::string reach_contest_id_;
+    std::string last_cmd_dir_;      // 上一条实际发出的移动指令（识别幻术用）
+    int illusion_until_ = -1;       // 幻术补偿持续到该 Tick
+    std::string retired0_, retired1_;  // 最近两个已退役场次
+    int retired_n_ = 0;
+};
+}  // namespace rmtc

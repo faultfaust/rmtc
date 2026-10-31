@@ -1,0 +1,440 @@
+// v12_check.cpp —— 规则 v1.2 关键改动的定向回归
+//
+// 覆盖：
+//   1) §7 复活选点：出生点优先、上→右→下→左、障碍只挡落点、被占则顺延；
+//   2) §8.5 天下无双：公告坐标优先（非中心 3×3 也能推断驻留并触发 5×5 攻击）；
+//   3) §8.7 火爆辣椒：相邻点位 + 同行敌人 → 主动踩点，触发计数增加。
+//
+// 这些断言只依赖 Agent/World 的公开接口，不启动模拟器，便于快速定位回归。
+#include <cstdio>
+#include <string>
+#include <vector>
+
+#include "rmtc/agent.h"
+#include "rmtc/config.h"
+#include "rmtc/event.h"
+#include "rmtc/event_prompt.h"
+#include "rmtc/json.h"
+#include "rmtc/planner.h"
+#include "rmtc/protocol.h"
+#include "rmtc/revive.h"
+
+namespace {
+
+int g_pass = 0;
+int g_fail = 0;
+
+#define CHECK(cond, msg)                                                   \
+    do {                                                                   \
+        if (cond) {                                                        \
+            ++g_pass;                                                      \
+        } else {                                                           \
+            ++g_fail;                                                      \
+            std::printf("FAIL: %s (line %d)\n", msg, __LINE__);            \
+        }                                                                  \
+    } while (0)
+
+std::string robotGrid(int dx, int dy) {
+    std::string out;
+    for (int r = 0; r < 9; ++r) {
+        for (int c = 0; c < 9; ++c) {
+            char ch = '0';
+            if (r == 4 && c == 4) ch = '1';
+            // 协议 §3：实体与自身重叠时中心保留 '1'，不能覆盖成 '2'。
+            else if (r == 4 + dy && c == 4 + dx) ch = '2';
+            out += ch;
+        }
+        if (r < 8) out += '\n';
+    }
+    return out;
+}
+
+std::string perceptionJson(int tick, int x, int y, bool alive, int hp,
+                           bool hasRobot, int rdx, int rdy,
+                           const std::string& eventText = "") {
+    std::string s = "{";
+    s += "\"tick\":" + std::to_string(tick);
+    s += ",\"session_id\":\"v12-check\"";
+    s += ",\"vision_radius\":4";
+    s += ",\"map\":{\"width\":24,\"height\":24}";
+    s += ",\"self\":{\"team\":\"A\",\"position\":[";
+    s += std::to_string(x) + "," + std::to_string(y) + "]";
+    s += ",\"hp\":" + std::to_string(hp);
+    s += ",\"alive\":" + std::string(alive ? "true" : "false");
+    s += ",\"protected\":false,\"respawn_in\":0,\"robot_id\":\"A\"";
+    s += ",\"last_action\":null}";
+    s += ",\"score\":{\"resource_value\":0,\"effective_damage\":0,";
+    s += "\"mission_completed\":0,\"mission_completed_ids\":[],\"invalid_actions\":0}";
+    s += ",\"visible_entities\":[";
+    if (hasRobot) {
+        s += "{\"type\":\"robot\",\"robot_id\":\"B\",\"team\":\"B\",";
+        s += "\"hp\":100,\"defending\":false,\"protected\":false,\"position\":\"";
+        s += rmtc::jsonEscape(robotGrid(rdx, rdy));
+        s += "\"}";
+    }
+    s += "],\"missions\":[],\"mission_text\":\"\"";
+    s += ",\"event_text\":\"" + rmtc::jsonEscape(eventText) + "\"}";
+    return s;
+}
+
+void testRespawn() {
+    const int W = 9, H = 9;
+    bool blocked[9][9] = {};
+    bool occupied[9][9] = {};
+    int x = -1, y = -1;
+
+    // 1) 出生点空闲：原地复活。
+    CHECK(rmtc::chooseRespawnCell(
+              4, 4, W, H, 0,
+              [&](int xx, int yy, int) { return blocked[yy][xx]; },
+              [&](int xx, int yy) { return occupied[yy][xx]; }, x, y) &&
+              x == 4 && y == 4,
+          "spawn free -> spawn cell");
+
+    // 2) 出生点被占：同距离按“上”优先。
+    occupied[4][4] = true;
+    CHECK(rmtc::chooseRespawnCell(
+              4, 4, W, H, 0,
+              [&](int xx, int yy, int) { return blocked[yy][xx]; },
+              [&](int xx, int yy) { return occupied[yy][xx]; }, x, y) &&
+              x == 4 && y == 3,
+          "occupied spawn -> up first");
+
+    // 3) 上也被占：右。
+    occupied[3][4] = true;
+    CHECK(rmtc::chooseRespawnCell(
+              4, 4, W, H, 0,
+              [&](int xx, int yy, int) { return blocked[yy][xx]; },
+              [&](int xx, int yy) { return occupied[yy][xx]; }, x, y) &&
+              x == 5 && y == 4,
+          "up occupied -> right");
+
+    // 4) 上/右/下都被静态障碍挡住：左（障碍只排除落点，不阻断搜索）。
+    blocked[3][4] = true;  // up
+    blocked[4][5] = true;  // right
+    blocked[5][4] = true;  // down
+    occupied[4][3] = occupied[3][4] = occupied[5][4] = occupied[4][5] = false;
+    occupied[4][4] = true;
+    CHECK(rmtc::chooseRespawnCell(
+              4, 4, W, H, 7,
+              [&](int xx, int yy, int) { return blocked[yy][xx]; },
+              [&](int xx, int yy) { return occupied[yy][xx]; }, x, y) &&
+              x == 3 && y == 4,
+          "up/right/down walled -> left, walls do not stop search");
+
+    // 5) 资源格允许：occupied 只表示车，不表示资源；出生点仍是首选。
+    occupied[4][4] = false;
+    CHECK(rmtc::chooseRespawnCell(
+              4, 4, W, H, 0,
+              [&](int xx, int yy, int) { return blocked[yy][xx]; },
+              [&](int xx, int yy) { return occupied[yy][xx]; }, x, y) &&
+              x == 4 && y == 4,
+          "resource cell is a legal landing cell");
+
+    // 6) 全图被占/阻挡时返回 false，但不越界。
+    for (int yy = 0; yy < H; ++yy)
+        for (int xx = 0; xx < W; ++xx) occupied[yy][xx] = true;
+    occupied[4][4] = false;
+    blocked[4][4] = true;
+    CHECK(!rmtc::chooseRespawnCell(
+              4, 4, W, H, 0,
+              [&](int xx, int yy, int) { return blocked[yy][xx]; },
+              [&](int xx, int yy) { return occupied[yy][xx]; }, x, y),
+          "no legal cell -> false");
+}
+
+void testUnrivaledSpecialRect() {
+    rmtc::Config cfg;
+    rmtc::Agent agent(cfg);
+    // 先建立 session（首帧会清空上一场状态；事件必须在首帧之后注入）。
+    agent.onPerception(perceptionJson(0, 3, 3, true, 100, false, 0, 0));
+    rmtc::EventReport rep;
+    rep.kind = rmtc::EVK_FORTRESS;
+    rep.x0 = 2; rep.y0 = 2; rep.x1 = 4; rep.y1 = 4;  // 非中心
+    rep.activate_tick = 1;
+    rep.end_tick = 100;
+    rep.confidence = 1.0f;
+    agent.injectTestEvent(rep);
+
+    // 连续 10 Tick 在 (3,3) 驻留。
+    for (int t = 1; t <= 10; ++t)
+        agent.onPerception(perceptionJson(t, 3, 3, true, 100, false, 0, 0));
+    CHECK(agent.unrivaledGrants() == 1, "special 3x3 fortress grants after 10 ticks");
+
+    // 第 11 Tick：5×5 内出现敌人，应直接 ATTACK。
+    const std::string out =
+        agent.onPerception(perceptionJson(11, 3, 3, true, 100, true, 1, 1));
+    const rmtc::Decision& d = agent.lastDecision();
+    CHECK(d.kind == rmtc::MOVE_ATTACK, "unrivaled 5x5 attack takes over");
+    CHECK(agent.unrivaledAttackCount() == 1, "unrivaled attack counter");
+    CHECK(out.find("\"action\":\"attack\"") != std::string::npos,
+          "encoded action is attack");
+
+    // 反例：同一位置、公告仍是“中心 11–13”时不应推断获得。
+    rmtc::Agent centerOnly(cfg);
+    centerOnly.onPerception(perceptionJson(0, 3, 3, true, 100, false, 0, 0));
+    rmtc::EventReport center;
+    center.kind = rmtc::EVK_FORTRESS;
+    center.x0 = 11; center.y0 = 11; center.x1 = 13; center.y1 = 13;
+    center.activate_tick = 1;
+    center.end_tick = 100;
+    center.confidence = 1.0f;
+    centerOnly.injectTestEvent(center);
+    for (int t = 1; t <= 12; ++t)
+        centerOnly.onPerception(perceptionJson(t, 3, 3, true, 100, false, 0, 0));
+    CHECK(centerOnly.unrivaledGrants() == 0,
+          "announcement is authoritative, not hardcoded center");
+}
+
+void testPepperTrap() {
+    rmtc::Config cfg;
+    rmtc::Agent agent(cfg);
+    agent.onPerception(perceptionJson(0, 5, 5, true, 100, false, 0, 0));
+    rmtc::EventReport rep;
+    rep.kind = rmtc::EVK_PEPPER;
+    rep.x0 = 6; rep.y0 = 5; rep.x1 = 6; rep.y1 = 5;
+    rep.activate_tick = 1;
+    rep.end_tick = 100;
+    rep.confidence = 1.0f;
+    agent.injectTestEvent(rep);
+
+    // 自己在 (5,5)，敌人在同一行 (8,5)：一步踩到 (6,5)，触发火线。
+    const std::string out =
+        agent.onPerception(perceptionJson(1, 5, 5, true, 100, true, 3, 0));
+    const rmtc::Decision& d = agent.lastDecision();
+    CHECK(agent.pepperTrapCount() == 1, "pepper trap counter");
+    CHECK(d.kind == rmtc::MOVE_MOVE &&
+              std::string(d.direction ? d.direction : "") == "right",
+          "pepper trap moves onto point");
+    CHECK(out.find("\"action\":\"move\"") != std::string::npos,
+          "encoded action is move");
+}
+
+void testPanCaution() {
+    rmtc::Config cfg;
+    rmtc::Agent agent(cfg);
+    agent.onPerception(perceptionJson(0, 5, 5, true, 100, false, 0, 0));
+    rmtc::EventReport rep;
+    rep.kind = rmtc::EVK_VULNERABLE;
+    rep.x0 = 0; rep.y0 = 0; rep.x1 = 23; rep.y1 = 23;
+    rep.activate_tick = 1;
+    rep.end_tick = 31;
+    rep.confidence = 1.0f;
+    agent.injectTestEvent(rep);
+
+    // 潘潘窗口内没有敌人/资源，规划器本来会探索移动；应改成原地防御。
+    const std::string out =
+        agent.onPerception(perceptionJson(1, 5, 5, true, 100, false, 0, 0));
+    const rmtc::Decision& d = agent.lastDecision();
+    CHECK(d.kind == rmtc::MOVE_DEFEND, "pan window turns explore move into defend");
+    CHECK(agent.panHoldCount() == 1, "pan hold counter");
+    CHECK(out.find("\"action\":\"defend\"") != std::string::npos,
+          "encoded pan action is defend");
+}
+
+void testSplitEscape() {
+    rmtc::Config cfg;
+    rmtc::Agent agent(cfg);
+    agent.onPerception(perceptionJson(0, 5, 5, true, 100, false, 0, 0));
+    rmtc::EventReport rep;
+    rep.kind = rmtc::EVK_SPLIT;
+    rep.x0 = 5; rep.y0 = 0; rep.x1 = 5; rep.y1 = 23;  // 竖线 x=5
+    rep.activate_tick = 3;
+    rep.end_tick = 33;
+    rep.confidence = 1.0f;
+    agent.injectTestEvent(rep);
+
+    // 生效前 2 Tick 仍在线上：应横移离轴。
+    const std::string out =
+        agent.onPerception(perceptionJson(1, 5, 5, true, 100, false, 0, 0));
+    const rmtc::Decision& d = agent.lastDecision();
+    CHECK(d.kind == rmtc::MOVE_MOVE, "split escape moves off the line");
+    CHECK(d.direction && (std::string(d.direction) == "left" ||
+                          std::string(d.direction) == "right"),
+          "split escape moves perpendicular");
+    CHECK(agent.splitEscapeCount() == 1, "split escape counter");
+    CHECK(out.find("\"action\":\"move\"") != std::string::npos,
+          "encoded split action is move");
+}
+
+void testAttackThroughWall() {
+    // 规则 §6.2：普通攻击沿直线 1–2 格，障碍不阻挡攻击。
+    rmtc::World w(9, 9);
+    w.markBlocked(6, 5);  // 中间有墙
+    rmtc::Perception p;
+    p.tick = 1;
+    p.x = 5;
+    p.y = 5;
+    p.hp = 100;
+    p.alive = true;
+    p.map_w = 9;
+    p.map_h = 9;
+    rmtc::RobotView foe;
+    foe.id = "B";
+    foe.x = 7;
+    foe.y = 5;
+    foe.hp = 100;
+    p.robots.push_back(foe);
+    rmtc::Radar radar;
+    radar.update(p.tick, p.x, p.y, p.robots);
+    rmtc::Combat combat;
+    rmtc::Decision d;
+    const bool acted = combat.decide(w, radar, p, d);
+    CHECK(acted && d.kind == rmtc::MOVE_ATTACK,
+          "attack passes through a wall (obstacle does not block §6.2)");
+}
+
+void testDelayedAnnouncement() {
+    // 公告/LLM 延迟：到达时 heal 已生效但 end_tick 仍在未来 → 应接受。
+    const std::string heal =
+        "{\"kind\":\"heal\",\"x0\":6,\"y0\":5,\"x1\":6,\"y1\":5,"
+        "\"activate_tick\":40,\"end_tick\":60,\"confidence\":0.9}";
+    rmtc::EventReport rep;
+    CHECK(rmtc::parseLlmEvent(heal, 45, 24, 24, 0.5f, rep) &&
+              rep.kind == rmtc::EVK_HEAL && rep.activate_tick == 40,
+          "delayed announcement: active duration event accepted");
+
+    // 瞬时爆炸已经过去：即使结果迟到也不能再当成有效事件。
+    const std::string pastBoom =
+        "{\"kind\":\"explosion\",\"x0\":6,\"y0\":5,\"x1\":6,\"y1\":5,"
+        "\"activate_tick\":40,\"end_tick\":-1,\"confidence\":0.9}";
+    CHECK(!rmtc::parseLlmEvent(pastBoom, 45, 24, 24, 0.5f, rep),
+          "delayed instant event (explosion) rejected");
+
+    // 持续型事件若模型没给 end_tick，无法证明仍生效；不猜经验值，直接拒绝。
+    const std::string noEnd =
+        "{\"kind\":\"heal\",\"x0\":6,\"y0\":5,\"x1\":6,\"y1\":5,"
+        "\"activate_tick\":40,\"end_tick\":-1,\"confidence\":0.9}";
+    CHECK(!rmtc::parseLlmEvent(noEnd, 45, 24, 24, 0.5f, rep),
+          "delayed duration event without end_tick rejected");
+}
+
+void testExplosionLifetime() {
+    // 公告在生效前到达：end=-1 是一次性，parser 应把它写成 activate+1。
+    const std::string boom =
+        "{\"kind\":\"explosion\",\"x0\":3,\"y0\":3,\"x1\":7,\"y1\":7,"
+        "\"activate_tick\":141,\"end_tick\":-1,\"confidence\":0.95}";
+    rmtc::EventReport rep;
+    CHECK(rmtc::parseLlmEvent(boom, 136, 24, 24, 0.5f, rep),
+          "on-time explosion accepted");
+    CHECK(rep.kind == rmtc::EVK_EXPLOSION && rep.end_tick == 142,
+          "instant explosion gets one-tick lifetime");
+
+    // 即使池子里残留 end=-1 的旧报告，生效 Tick 之后也不能再 avoid。
+    rmtc::EventReport stale;
+    stale.kind = rmtc::EVK_EXPLOSION;
+    stale.x0 = 3; stale.y0 = 3; stale.x1 = 7; stale.y1 = 7;
+    stale.activate_tick = 141;
+    stale.end_tick = -1;
+    stale.confidence = 0.95f;
+    rmtc::Perception p;
+    p.tick = 150;
+    p.x = 3; p.y = 3;
+    p.hp = 100;
+    p.alive = true;
+    rmtc::World w(24, 24);
+    rmtc::EventScorer scorer;
+    const rmtc::EventAdvice adv = scorer.score(stale, p, w);
+    CHECK(!adv.avoid, "stale end=-1 explosion no longer avoided after blast");
+}
+
+std::string reachPerception(int tick, int x, int y) {
+    std::string s = perceptionJson(tick, x, y, true, 100, false, 0, 0);
+    const std::string from = "\"missions\":[]";
+    const std::string to =
+        "\"missions\":[{\"id\":\"reach_target\",\"type\":\"reach\","
+        "\"target\":1,\"position\":[9,14]}]";
+    const std::size_t pos = s.find(from);
+    if (pos != std::string::npos) s.replace(pos, from.size(), to);
+    return s;
+}
+
+void testOpportunisticReach() {
+    // 任务点 (9,14) 就在正上方一格；R=400，远没到死线。
+    // 旧逻辑会因 R>160 放弃，新逻辑应直接踩进去。
+    rmtc::Config cfg;
+    rmtc::Agent agent(cfg);  // 注意：Agent(Config()) 会被解析成函数声明（MVP）
+    const std::string out = agent.onPerception(reachPerception(100, 9, 15));
+    CHECK(out.find("\"action\":\"move\"") != std::string::npos,
+          "adjacent reach action emitted");
+    CHECK(agent.lastDecision().reason == rmtc::R_MOVE_RESOURCE &&
+              agent.lastDecision().direction &&
+              std::string(agent.lastDecision().direction) == "up",
+          "adjacent reach goes up before deadline");
+}
+
+void testEventParseStatus() {
+    // 同一份 schema 下区分：可用的未来爆炸、已过去的爆炸（重复公告）、
+    // 模型明确 unknown（状态行）、以及真正的字段/坐标错误。
+    rmtc::EventParseStatus st = rmtc::EVENT_PARSE_INVALID;
+    rmtc::EventReport rep;
+    const std::string future =
+        "{\"kind\":\"explosion\",\"x0\":3,\"y0\":3,\"x1\":7,\"y1\":7,"
+        "\"activate_tick\":60,\"end_tick\":-1,\"confidence\":0.95}";
+    CHECK(rmtc::parseLlmEvent(future, 50, 24, 24, 0.5f, rep, &st) &&
+              st == rmtc::EVENT_PARSE_OK,
+          "future explosion -> EVENT_PARSE_OK");
+
+    const std::string past =
+        "{\"kind\":\"explosion\",\"x0\":3,\"y0\":3,\"x1\":7,\"y1\":7,"
+        "\"activate_tick\":40,\"end_tick\":-1,\"confidence\":0.95}";
+    CHECK(!rmtc::parseLlmEvent(past, 50, 24, 24, 0.5f, rep, &st) &&
+              st == rmtc::EVENT_PARSE_STALE,
+          "past explosion -> EVENT_PARSE_STALE");
+
+    const std::string noEvent =
+        "{\"kind\":\"unknown\",\"x0\":0,\"y0\":0,\"x1\":0,\"y1\":0,"
+        "\"activate_tick\":0,\"end_tick\":-1,\"confidence\":0.0}";
+    CHECK(!rmtc::parseLlmEvent(noEvent, 50, 24, 24, 0.5f, rep, &st) &&
+              st == rmtc::EVENT_PARSE_NO_EVENT,
+          "unknown kind -> EVENT_PARSE_NO_EVENT");
+
+    const std::string bad =
+        "{\"kind\":\"explosion\",\"x0\":99,\"y0\":3,\"x1\":7,\"y1\":7,"
+        "\"activate_tick\":60,\"end_tick\":-1,\"confidence\":0.95}";
+    CHECK(!rmtc::parseLlmEvent(bad, 50, 24, 24, 0.5f, rep, &st) &&
+              st == rmtc::EVENT_PARSE_INVALID,
+          "out-of-map explosion -> EVENT_PARSE_INVALID");
+}
+
+void testTerrainHysteresis() {
+    // 障碍实体偶发缺失一帧不能立刻把墙删掉；连续 2 帧缺失才恢复 FREE。
+    rmtc::World w(9, 9);
+    rmtc::Perception p;
+    p.tick = 0;
+    p.x = 4; p.y = 4;
+    p.map_w = 9; p.map_h = 9;
+    p.vision_radius = 4;
+    rmtc::Entity wall;
+    wall.kind = rmtc::ENT_OBSTACLE;
+    wall.x = 5; wall.y = 4;
+    p.entities.push_back(wall);
+    w.updateFromPerception(p);
+    const int wi = w.idx(5, 4);
+    CHECK(w.state()[wi] == rmtc::World::BLOCKED, "wall seen -> BLOCKED");
+    p.tick = 1;
+    p.entities.clear();
+    w.updateFromPerception(p);
+    CHECK(w.state()[wi] == rmtc::World::BLOCKED, "one missing frame keeps wall");
+    p.tick = 2;
+    w.updateFromPerception(p);
+    CHECK(w.state()[wi] == rmtc::World::FREE, "two missing frames clear wall");
+}
+
+}  // namespace
+
+int main() {
+    testRespawn();
+    testUnrivaledSpecialRect();
+    testPepperTrap();
+    testPanCaution();
+    testSplitEscape();
+    testAttackThroughWall();
+    testDelayedAnnouncement();
+    testEventParseStatus();
+    testExplosionLifetime();
+    testOpportunisticReach();
+    testTerrainHysteresis();
+    std::printf("v12_check: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail == 0 ? 0 : 1;
+}

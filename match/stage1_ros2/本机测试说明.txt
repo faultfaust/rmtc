@@ -1,0 +1,1 @@
+rmtc_practice目录在~/rmtc_test下

@@ -1,0 +1,12 @@
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+.idea/
+cmake-build-debug/
+.vscode/
+*.bak
+*.bak_eventfix
+.DS_Store

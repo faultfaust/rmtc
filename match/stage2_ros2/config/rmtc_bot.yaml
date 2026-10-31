@@ -1,0 +1,4 @@
+rmtc_bot:
+  ros__parameters:
+    seat: "A"
+    team_name: "RMTC Bot"
